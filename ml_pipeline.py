@@ -7,6 +7,7 @@ import pandas as pd
 import spacy
 from sklearn.metrics.pairwise import cosine_similarity
 from shap import TreeExplainer
+from skill_extractor import extract_skills
 
 # Load models once at module level (not on every request)
 xgb_model = joblib.load('model_xgb.pkl')
@@ -23,37 +24,50 @@ def clean_resume(text):
     ])
 
 def predict_resume(resume_text, top_n_shap=10):
+
     cleaned = clean_resume(resume_text)
+    skills = extract_skills(resume_text)
 
     # Dense vector for XGBoost + SHAP
     vector = vectorizer.transform([cleaned]).toarray()
+
     print("=" * 60)
     print("Vector sum:", np.sum(vector))
     print("Non-zero features:", np.count_nonzero(vector))
     print("First 20 values:", vector[0][:20])
     print("=" * 60)
-    
-    pred_num = int(xgb_model.predict(vector)[0])
+
+    # ---------- Prediction ----------
+    pred_num = xgb_model.predict(vector)[0]
+
     pred_label = encoder.inverse_transform([pred_num])[0]
 
-    confidence = float(
-        xgb_model.predict_proba(vector)[0][pred_num]
-    )
     probs = xgb_model.predict_proba(vector)[0]
+    confidence = float(probs[pred_num])
 
-    top5 = np.argsort(probs)[::-1][:5]
-    
+    model_note = None
+
+    if confidence < 0.50:
+        model_note = (
+            "Prediction confidence is low. "
+            "Treat this role suggestion as unreliable."
+        )
+        pred_label = "Unknown"
+
     print("\nTop 5 Predictions")
     print("-" * 40)
+
+    top5 = np.argsort(probs)[::-1][:5]
+
     for idx in top5:
         print(
             f"{encoder.inverse_transform([idx])[0]:25} {probs[idx]:.4f}"
         )
-    print("-" * 40)
-    # -------- SHAP --------
-    shap_exp = explainer(vector)
 
-    # Your SHAP shape is (1, 1500, 25)
+    print("-" * 40)
+
+    # ---------- SHAP ----------
+    shap_exp = explainer(vector)
     shap_arr = shap_exp.values
 
     class_shap = shap_arr[0, :, pred_num]
@@ -65,15 +79,16 @@ def predict_resume(resume_text, top_n_shap=10):
         "shap_value": class_shap
     })
 
-    # Sort by absolute contribution
     word_shap = word_shap.loc[
         word_shap["shap_value"].abs().sort_values(ascending=False).index
     ].reset_index(drop=True)
 
     return {
         "predicted_category": pred_label,
-        "confidence": round(confidence, 4),
-        "top_words": word_shap.head(top_n_shap).to_dict(orient="records")
+        "confidence": confidence,
+        "model_note": model_note,
+        "skills": skills,
+        "top_words": word_shap.to_dict(orient="records")
     }
 
 def screen_candidates(job_description, candidates, top_n=10):
@@ -99,3 +114,11 @@ def screen_candidates(job_description, candidates, top_n=10):
         })
     
     return sorted(results, key=lambda x: x['similarity_score'], reverse=True)[:top_n]
+
+def predict_resume_with_skills(resume_text):
+    prediction = predict_resume(resume_text)
+    skills = extract_skills(resume_text)
+
+    prediction["skills"] = skills
+
+    return prediction

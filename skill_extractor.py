@@ -2,6 +2,7 @@
 import spacy
 from spacy.matcher import PhraseMatcher
 from typing import List
+import fitz
 
 nlp = spacy.load("en_core_web_sm")
 
@@ -70,4 +71,32 @@ def compute_skill_gap(resume_skills: List[str], jd_skills: List[str]):
         "missing": missing,
         "extra": extra,
         "match_score": match_score,   # % of JD skills covered
+    }
+
+
+doc = fitz.open("myntra_resume.pdf")
+
+text = ""
+
+for page in doc:
+    text += page.get_text()
+
+print(extract_skills(text))
+def compute_skill_gap(resume_skills, jd_skills):
+    resume_set = set(skill.lower() for skill in resume_skills)
+    jd_set = set(skill.lower() for skill in jd_skills)
+
+    matched = sorted(list(resume_set & jd_set))
+    missing = sorted(list(jd_set - resume_set))
+    extra = sorted(list(resume_set - jd_set))
+
+    match_score = round(
+        (len(matched) / len(jd_set)) * 100, 1
+    ) if jd_set else 0.0
+
+    return {
+        "matched": matched,
+        "missing": missing,
+        "extra": extra,
+        "match_score": match_score
     }

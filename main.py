@@ -1,12 +1,20 @@
 # main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import fitz  # PyMuPDF
 import io
-from typing import List
-from ml_pipeline import predict_resume, screen_candidates
+from typing import Annotated, List
+from ml_pipeline import (
+    predict_resume,
+    predict_resume_with_skills,
+    screen_candidates,
+    vectorizer,
+    clean_resume
+)
 from skill_extractor import extract_skills, compute_skill_gap
+from sklearn.metrics.pairwise import cosine_similarity
+
 
 # ── App setup ──────────────────────────────────────────
 app = FastAPI(
@@ -50,6 +58,17 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         text += page.get_text()
     return text.strip()
 
+def compute_cosine_similarity(resume_text: str, job_description: str):
+    resume_vector = vectorizer.transform([clean_resume(resume_text)])
+    jd_vector = vectorizer.transform([clean_resume(job_description)])
+
+    similarity = cosine_similarity(
+        resume_vector,
+        jd_vector
+    )[0][0]
+
+    return round(float(similarity), 4)
+    
 # ── Health check ───────────────────────────────────────
 @app.get("/")
 def root():
@@ -117,107 +136,74 @@ def screen_resumes(request: ScreenRequest):
         "total_candidates": len(candidates),
         "ranked_candidates": ranked
     }
-# ─── NEW ENDPOINT 1: Single resume analysis ──────────────────────────────────
-
 @app.post("/analyze")
 async def analyze_resume(file: UploadFile = File(...)):
-    """
-    Upload a PDF → get skills, suggested role, confidence, SHAP words.
-    This is the new primary single-resume endpoint.
-    """
-    try:
-        pdf_bytes = await file.read()
-        text = extract_text_from_pdf(pdf_bytes)           # your existing helper
-        cleaned = clean_text(text)                        # from ml_pipeline.py
 
-        # ML layer — role suggestion (kept, now labeled as "suggested")
-        prediction = predict_resume(cleaned)              # your existing function
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported"
+        )
 
-        # New: skill extraction
-        skills = extract_skills(cleaned)
+    file_bytes = await file.read()
 
-        return {
-            "status": "success",
-            "skills": skills,
-            "suggested_role": prediction["category"],
-            "confidence": prediction["confidence"],
-            "shap_words": prediction["shap_words"],
-            "raw_text_preview": cleaned[:300],
-        }
-    except Exception as e:
-        logger.error(f"/analyze error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    resume_text = extract_text_from_pdf(file_bytes)
 
+    result = predict_resume(resume_text)
 
-# ─── NEW ENDPOINT 2: Multi-candidate screening ────────────────────────────────
-
-class ScreenRequestV2(BaseModel):
-    job_description: str
-    generate_summaries: bool = False
+    return {
+        "filename": file.filename,
+        "skills": result["skills"],
+        "predicted_category": result["predicted_category"],
+        "confidence": result["confidence"],
+        "model_note": result["model_note"],
+        "top_words": result["top_words"],
+        "preview": resume_text[:300]
+    }
 
 @app.post("/screen/v2")
-async def screen_candidates_v2(
+async def screen_v2(
     job_description: str = Form(...),
-    generate_summaries: bool = Form(False),
     files: List[UploadFile] = File(...),
 ):
-    """
-    JD + multiple PDFs → ranked recruiter scorecards.
-    """
-    try:
-        jd_skills = extract_skills(job_description)
-        results = []
+    jd_skills = extract_skills(job_description)
+    candidates = []
+    for file in files:
 
-        for file in files:
-            pdf_bytes = await file.read()
-            text = extract_text_from_pdf(pdf_bytes)
-            cleaned = clean_text(text)
+        pdf_bytes = await file.read()
+        resume_text = extract_text_from_pdf(pdf_bytes)
+        prediction = predict_resume_with_skills(resume_text)
+        similarity = compute_cosine_similarity(
+            resume_text,
+            job_description
+        )
 
-            # Skills
-            resume_skills = extract_skills(cleaned)
-            skill_gap = compute_skill_gap(resume_skills, jd_skills)
+        skill_gap = compute_skill_gap(
+            prediction["skills"],
+            jd_skills
+        )
 
-            # Cosine similarity (your existing logic)
-            similarity = compute_cosine_similarity(cleaned, job_description)  # adjust to your fn name
+        candidates.append({
+            "filename": file.filename,
+            "suggested_role": prediction["predicted_category"],
+            "confidence": prediction["confidence"],
+            "skills": prediction["skills"],
+            "skill_gap": skill_gap,
+            "similarity_score": similarity,
+            "top_words": prediction["top_words"]
+        })
 
-            # Role suggestion
-            prediction = predict_resume(cleaned)
+    candidates.sort(
 
-            # Optional LLM summary
-            summary = None
-            if generate_summaries:
-                summary = generate_candidate_summary(
-                    resume_text=cleaned,
-                    job_description=job_description,
-                    skills=resume_skills,
-                    skill_gap=skill_gap,
-                    similarity=similarity,
-                    suggested_role=prediction["category"],
-                )
-
-            results.append({
-                "filename": file.filename,
-                "skills": resume_skills,
-                "skill_gap": skill_gap,
-                "similarity_score": similarity,
-                "suggested_role": prediction["category"],
-                "confidence": prediction["confidence"],
-                "shap_words": prediction["shap_words"],
-                "llm_summary": summary,
-            })
-
-        # Rank by skill match_score first, then cosine similarity as tiebreak
-        results.sort(key=lambda x: (
+        key=lambda x: (
             x["skill_gap"]["match_score"],
             x["similarity_score"]
-        ), reverse=True)
+        ),
+        reverse=True
+    )
 
-        return {
-            "status": "success",
-            "jd_skills": jd_skills,
-            "candidates": results,
-        }
-
-    except Exception as e:
-        logger.error(f"/screen/v2 error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "jd_skills": jd_skills,
+        "candidates": candidates
+    }
+    
